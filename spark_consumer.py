@@ -250,12 +250,13 @@ class SparkHoeffdingEnsemble:
 
                 # Label-free signal for drift detection.
                 # Class 1/attack probability above 0.5 is treated as suspicious.
-                y_S = None
-                if states == [] or states[-1] == "Normal" or y is None:
+                prior_condition = self.detectors[tree_id].condition  # this tree's own last known state
+
+                if prior_condition == "Normal" or y is None:
                     error_signal = int(score >= ERROR_THRESHOLD)
                     y_S = final_pred
                 else:
-                    error_signal = y != pred
+                    error_signal = int(y != pred)
                     y_S = y
 
                 
