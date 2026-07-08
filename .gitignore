@@ -1,0 +1,46 @@
+# 🧠 Python environment and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# 🧰 Virtual environment
+.venv/
+venv/
+env/
+
+# 🧪 Checkpoints and model outputs
+checkpoints/
+models/
+data/
+
+# 🐳 Docker artifacts
+docker-compose.override.yml
+*.log
+
+# ⚙️ Spark and training temporary files
+spark_consumer/
+train_models/
+kdd_producer/
+
+# 📝 Notes and local files
+notes*
+
+# 🪟 Windows-specific files
+Thumbs.db
+Desktop.ini
+
+# 🚀 IDE and editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 🔒 System or temporary files
+*.tmp
+*.bak
+*.old
