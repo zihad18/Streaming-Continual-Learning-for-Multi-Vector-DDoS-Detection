@@ -134,20 +134,20 @@ class SparkHoeffdingEnsemble:
         return Counter(preds).most_common(1)[0][0]
 
     def prediction_and_score(self, model, x_dict):
-    proba = model.predict_proba_one(x_dict) or {}
-    pred = model.predict_one(x_dict)
+        proba = model.predict_proba_one(x_dict) or {}
+        pred = model.predict_one(x_dict)
 
-    if pred is None:
-        pred = max(proba, key=proba.get) if len(proba) > 0 else 0
-    pred = int(pred)
+        if pred is None:
+            pred = max(proba, key=proba.get) if len(proba) > 0 else 0
+        pred = int(pred)
 
-    # Error-likelihood proxy — NOT "probability this is an attack".
-    # Low confidence in whatever class was predicted = high chance the
-    # prediction is wrong, regardless of whether that class is normal or attack.
-    confidence = float(proba.get(pred, 1.0)) if len(proba) > 0 else 0.5
-    error_score = 1.0 - confidence
+        # Error-likelihood proxy — NOT "probability this is an attack".
+        # Low confidence in whatever class was predicted = high chance the
+        # prediction is wrong, regardless of whether that class is normal or attack.
+        confidence = float(proba.get(pred, 1.0)) if len(proba) > 0 else 0.5
+        error_score = 1.0 - confidence
 
-    return pred, error_score
+        return pred, error_score
     def update_metrics(self, y, pred):
         self.total += 1
         if y == 0:
