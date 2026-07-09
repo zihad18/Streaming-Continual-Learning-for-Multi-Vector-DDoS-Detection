@@ -22,8 +22,7 @@ N_TREES = int(os.getenv("N_TREES", "5"))
 ERROR_THRESHOLD = float(os.getenv("ERROR_THRESHOLD", "0.35"))
 
 LOCAL_MODE = os.getenv("LOCAL_MODE", "true").lower() == "true"
-GCS_BUCKET = os.getenv("GCS_BUCKET", "your-bucket-name")
-
+BUCKET = os.getenv("BUCKET", "gs://kdd-streaming-bucket")
 # ----------------------------- Metrics Schema --------------------------------
 metrics_schema = StructType([
     StructField("node_host", StringType(), True),
@@ -349,21 +348,43 @@ def process_partition(rows):
 
 
 def foreach_batch_function(batch_df, batch_id):
+    print(
+        f"[DRIVER] Batch {batch_id} received",
+        flush=True
+    )
+
     if batch_df.rdd.isEmpty():
+        print(
+            f"[DRIVER] Batch {batch_id} is EMPTY",
+            flush=True
+        )
         return
 
-    metrics_rdd = batch_df.rdd.mapPartitions(process_partition)
-    metrics_df = batch_df.sparkSession.createDataFrame(metrics_rdd, schema=metrics_schema)
+    count = batch_df.count()
 
-    # ---- Local vs GCS output ----
+    print(
+        f"[DRIVER] Batch {batch_id}: {count} Kafka records",
+        flush=True
+    )
+
+    metrics_rdd = batch_df.rdd.mapPartitions(process_partition)
+
+    metrics_df = batch_df.sparkSession.createDataFrame(
+        metrics_rdd,
+        schema=metrics_schema
+    )
+
     if LOCAL_MODE:
         output_path = "file:///C:/temp/metrics"
     else:
-        output_path = f"gs://{GCS_BUCKET}/metrics/batch_id={batch_id}"
+        output_path = f"{GCS_BUCKET}/metrics/batch_id={batch_id}"
 
     metrics_df.write.mode("append").json(output_path)
-    print(f"[Batch {batch_id}] Metrics written to {output_path}")
 
+    print(
+        f"[DRIVER] Batch {batch_id} metrics written to {output_path}",
+        flush=True
+    )
 
 def main():
     builder = SparkSession.builder.appName("GCP-Distributed-KDD-Hoeffding-Ensemble-Threaded")
@@ -386,7 +407,7 @@ def main():
     if LOCAL_MODE:
         checkpoint = "file:///C:/temp/metrics"
     else:
-        checkpoint = f"gs://{GCS_BUCKET}/checkpoints/kdd_stream_consumer"
+        checkpoint = f"{BUCKET}/checkpoints/kdd_stream_consumer"
 
     query = (
         values_df.writeStream
