@@ -17,7 +17,8 @@ env/
 checkpoints/
 models/
 data/
-models.zip
+*.zip
+
 # 🐳 Docker artifacts
 docker-compose.override.yml
 *.log
