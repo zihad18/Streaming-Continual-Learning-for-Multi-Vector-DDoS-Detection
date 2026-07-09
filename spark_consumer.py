@@ -6,6 +6,7 @@ import numpy as np
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
+import joblib
 
 from pyspark import TaskContext, SparkFiles
 from pyspark.sql import SparkSession, Row
