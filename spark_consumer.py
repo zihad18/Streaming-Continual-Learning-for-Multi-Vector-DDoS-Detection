@@ -2,24 +2,22 @@ import json
 import os
 import joblib
 import numpy as np
-from collections import Counter
+from collections import deque, Counter
+from river.drift import ADWIN
 
 from pyspark.sql import SparkSession
 
 MODEL_DIR = os.getenv("MODEL_DIR", "models")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "kdd_stream")
 KAFKA_SERVER = os.getenv("KAFKA_SERVER", "localhost:9092")
-N_TREES = int(os.getenv("N_TREES", "5"))
-ERROR_THRESHOLD = float(os.getenv("ERROR_THRESHOLD", 0.35))
-
-# If LOCAL_MODE=true, Spark runs with local[5].
-# On Dataproc/cloud, run with LOCAL_MODE=false.
 LOCAL_MODE = os.getenv("LOCAL_MODE", "true").lower() == "true"
+N_TREES = int(os.getenv("N_TREES", "5"))
 
+LABEL_DELAY_SIZE = int(os.getenv("LABEL_DELAY", "500"))
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.8"))  # <-- New env var
 
 def row_to_dict(row):
     return {f"f{i}": float(v) for i, v in enumerate(row)}
-
 
 def safe_json_loads(value):
     if isinstance(value, bytes):
@@ -27,96 +25,28 @@ def safe_json_loads(value):
     return json.loads(value)
 
 
-class RealTimeOAW:
-    """
-    Label-free drift detector.
-
-    It does not use true labels. It watches an online anomaly signal:
-        1 = model thinks current record is suspicious
-        0 = model thinks current record is normal
-
-    This is closer to production, where incoming traffic has no label.
-    """
-    def __init__(self, Ath=1.5, Dth=2.0, Ls=200, La=500):
-        self.Ath = Ath
-        self.Dth = Dth
-        self.Ls = Ls
-        self.La = La
-
-        self.condition = "Normal"
-        self.signal_stream = []
-        self.adapt_win = []
-        self.j_ar = None
-
-    def compute_ar(self, window):
-        return float(np.mean(window)) if len(window) > 0 else 0.0
-
-    def update(self, anomaly_signal, sample):
-        self.signal_stream.append(int(anomaly_signal))
-
-        if len(self.signal_stream) < 2 * self.Ls:
-            return self.condition, False, []
-
-        current_window = self.signal_stream[-self.Ls:]
-        previous_window = self.signal_stream[-2 * self.Ls:-self.Ls]
-
-        ar_current = self.compute_ar(current_window)
-        ar_previous = max(self.compute_ar(previous_window), 1e-6)
-
-        retrain = False
-        retrain_data = []
-
-        if self.condition == "Normal":
-            if ar_current >= self.Ath * ar_previous:
-                self.condition = "Alert"
-                self.adapt_win = [sample]
-
-        elif self.condition == "Alert":
-            if ar_current >= self.Dth * ar_previous:
-                self.condition = "Drift"
-                self.j_ar = ar_current
-                self.adapt_win.append(sample)
-                retrain = True
-                retrain_data = self.adapt_win.copy()
-
-            elif ar_current < self.Ath * ar_previous or len(self.adapt_win) >= self.La:
-                self.condition = "Normal"
-                self.adapt_win = []
-
-            else:
-                self.adapt_win.append(sample)
-
-        elif self.condition == "Drift":
-            if self.j_ar is None:
-                self.j_ar = ar_current
-
-            if ar_current >= self.Ath * self.j_ar or len(self.adapt_win) >= self.La:
-                retrain = True
-                retrain_data = self.adapt_win.copy()
-                self.condition = "Normal"
-                self.adapt_win = []
-                self.j_ar = None
-            else:
-                self.adapt_win.append(sample)
-
-        return self.condition, retrain, retrain_data
-
-
 class SparkHoeffdingEnsemble:
     def __init__(self, n_trees=N_TREES):
+        # Load your actual ensemble models
         self.preprocessor = joblib.load(f"{MODEL_DIR}/preprocessor.pkl")
-
         self.models = [
             joblib.load(f"{MODEL_DIR}/tree_{i}.pkl")
             for i in range(n_trees)
         ]
-
-        self.detectors = [
-            RealTimeOAW(Ath=1.5, Dth=2.0, Ls=200, La=500)
-            for _ in range(n_trees)
-        ]
-
         self.n_trees = n_trees
+
+        # Buffer to hold (features, true_label)
+        self.label_buffer = deque(maxlen=LABEL_DELAY_SIZE)
+
+        # --- PER-TREE ADWIN DETECTORS (Monitoring CONFIDENCE, not ERROR) ---
+        self.drift_detectors = [ADWIN() for _ in range(n_trees)]
+
+        # Per-tree metrics
+        self.tree_total = [0] * n_trees
+        self.tree_correct = [0] * n_trees
+        self.tree_drifts = [0] * n_trees
+
+        # Global ensemble metrics
         self.total = 0
         self.correct = 0
         self.tp = 0
@@ -125,37 +55,21 @@ class SparkHoeffdingEnsemble:
         self.fn = 0
         self.seen_normal = 0
         self.seen_anomaly = 0
-
-        self.tree_total = [0] * n_trees
-        self.tree_correct = [0] * n_trees
-        self.tree_drifts = [0] * n_trees
+        self.drift_count = 0
 
     def majority_vote(self, preds):
         return Counter(preds).most_common(1)[0][0]
 
-    def prediction_and_score(self, model, x_dict):
-        proba = model.predict_proba_one(x_dict) or {}
-        pred = model.predict_one(x_dict)
-
-        if pred is None:
-            pred = max(proba, key=proba.get) if len(proba) > 0 else 0
-        pred = int(pred)
-
-        # Error-likelihood proxy — NOT "probability this is an attack".
-        # Low confidence in whatever class was predicted = high chance the
-        # prediction is wrong, regardless of whether that class is normal or attack.
-        confidence = float(proba.get(pred, 1.0)) if len(proba) > 0 else 0.5
-        error_score = 1.0 - confidence
-
-        return pred, error_score
     def update_metrics(self, y, pred):
         self.total += 1
         if y == 0:
             self.seen_normal += 1
         elif y == 1:
             self.seen_anomaly += 1
+
         if pred == y:
             self.correct += 1
+
         if y == 1 and pred == 1:
             self.tp += 1
         elif y == 0 and pred == 0:
@@ -165,38 +79,20 @@ class SparkHoeffdingEnsemble:
         elif y == 1 and pred == 0:
             self.fn += 1
 
-    def print_metrics(self, rid, y, final_pred, tree_preds, scores, states):
+    def print_metrics(self, rid, y, final_pred, confidence, tree_preds, tree_accs):
         accuracy = self.correct / max(self.total, 1)
         precision = self.tp / max(self.tp + self.fp, 1)
         recall = self.tp / max(self.tp + self.fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-12)
 
         print("=" * 80)
-        print("Record ID:", rid)
-        if y is not None:
-            print("True label:", y)
-        print("Tree predictions:", tree_preds)
-        print("Tree anomaly scores:", [round(s, 4) for s in scores])
-        print("Final ensemble prediction:", final_pred)
-        print("Tree states:", states)
-
-        if y is not None:
-            print("Ensemble accuracy:", round(accuracy, 4))
-            print("Precision:", round(precision, 4))
-            print("Recall:", round(recall, 4))
-            print("F1:", round(f1, 4))
-            print(f"Seen labels: normal={self.seen_normal}, anomaly={self.seen_anomaly}")
-            print(f"Confusion matrix: TP={self.tp}, TN={self.tn}, FP={self.fp}, FN={self.fn}")
-
-        for tree_id in range(self.n_trees):
-            if y is not None:
-                acc = self.tree_correct[tree_id] / max(self.tree_total[tree_id], 1)
-                print(
-                    f"Tree {tree_id}: accuracy={acc:.4f}, "
-                    f"drifts={self.tree_drifts[tree_id]}"
-                )
-            else:
-                print(f"Tree {tree_id}: drifts={self.tree_drifts[tree_id]}")
+        print(f"Record ID: {rid} | True: {y} | Ensemble Pred: {final_pred} | Conf: {confidence:.2f}")
+        print(f"Tree preds: {tree_preds}")
+        print(f"Tree accuracies: {[round(a, 3) for a in tree_accs]}")
+        print(f"Tree drifts: {self.tree_drifts}")
+        print(f"Global: Acc={accuracy:.3f}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}")
+        print(f"Confusion: TP={self.tp}, TN={self.tn}, FP={self.fp}, FN={self.fn}")
+        print("=" * 80)
 
     def process_pdf(self, pdf):
         if len(pdf) == 0:
@@ -209,11 +105,9 @@ class SparkHoeffdingEnsemble:
         features = pdf.drop(columns=["label", "record_id"], errors="ignore")
 
         cat_cols = self.preprocessor.transformers_[0][2]
-
         for col in cat_cols:
             if col in features.columns:
                 features[col] = features[col].astype(str)
-
 
         X = self.preprocessor.transform(features).toarray()
 
@@ -222,72 +116,94 @@ class SparkHoeffdingEnsemble:
             rid = int(record_ids[idx])
             x_dict = row_to_dict(x)
 
+            # 1. PREDICT WITH ALL TREES
             tree_preds = []
-            anomaly_scores = []
-
             for model in self.models:
-                pred, score = self.prediction_and_score(model, x_dict)
-                tree_preds.append(pred)
-                anomaly_scores.append(score)
-
+                pred = model.predict_one(x_dict)
+                tree_preds.append(0 if pred is None else int(pred))
+            
             final_pred = self.majority_vote(tree_preds)
+            confidence = tree_preds.count(final_pred) / self.n_trees
 
+            # 2. UPDATE ENSEMBLE METRICS (if label available)
             if y is not None:
                 self.update_metrics(y, final_pred)
-            else:
-                self.total += 1
 
-            states = []
+            # 3. STORE FOR LABEL LATENCY
+            if y is not None:
+                self.label_buffer.append((x_dict, y))
 
-            for tree_id, model in enumerate(self.models):
-                pred = tree_preds[tree_id]
-                score = anomaly_scores[tree_id]
-
-                if y is not None:
-                    self.tree_total[tree_id] += 1
-                    if pred == y:
-                        self.tree_correct[tree_id] += 1
-
-                # Label-free signal for drift detection.
-                # Class 1/attack probability above 0.5 is treated as suspicious.
-                prior_condition = self.detectors[tree_id].condition  # this tree's own last known state
-
-                if prior_condition == "Normal" or y is None:
-                    error_signal = int(score >= ERROR_THRESHOLD)
-                    y_S = final_pred
-                else:
-                    error_signal = int(y != pred)
-                    y_S = y
-
+            # 4. PER-TREE DRIFT DETECTION USING CONFIDENCE (UNSUPERVISED SIGNAL)
+            if len(self.label_buffer) == self.label_buffer.maxlen:
+                old_x, old_y = self.label_buffer[0]  # Oldest record (label just arrived)
                 
+                # Loop over each tree independently
+                for tree_id in range(self.n_trees):
+                    # ============================================================
+                    # CRITICAL CHANGE: Use Confidence, NOT Prediction Error
+                    # ============================================================
+                    # Get probability for the historical record
+                    proba = self.models[tree_id].predict_proba_one(old_x) or {}
+                    old_confidence = max(proba.values()) if proba else 0.5
+                    
+                    # Drift signal: 1 = uncertain (low confidence), 0 = confident
+                    # This mimics Option B's label-free drift detection
+                    uncertainty_signal = 1 if old_confidence < CONFIDENCE_THRESHOLD else 0
+                    
+                    # Update this tree's ADWIN with the uncertainty signal
+                    self.drift_detectors[tree_id].update(uncertainty_signal)
+                    
+                    # Update per-tree accuracy metrics (still using true labels)
+                    if y is not None:
+                        old_pred = self.models[tree_id].predict_one(old_x)
+                        old_pred = 0 if old_pred is None else int(old_pred)
+                        self.tree_total[tree_id] += 1
+                        if old_pred == old_y:
+                            self.tree_correct[tree_id] += 1
 
-                condition, retrain, retrain_data = self.detectors[tree_id].update(
-                    anomaly_signal=error_signal,
-                    sample=(x_dict, y_S)
-                )
+                    # --- TARGETED DRIFT HANDLING FOR THIS SPECIFIC TREE ---
+                    if self.drift_detectors[tree_id].drift_detected:
+                        self.tree_drifts[tree_id] += 1
+                        self.drift_count += 1
+                        
+                        # ADWIN's width = number of recent records in the NEW concept
+                        drifted_window_size = self.drift_detectors[tree_id].width
+                        
+                        print(f"[DRIFT] Tree {tree_id} detected shift at record {rid} (Confidence-based)")
+                        print(f"   [PROOF] Low-confidence period spans last {drifted_window_size} records.")
+                        
+                        # Extract the EXACT drifted window from the buffer
+                        drifted_records = list(self.label_buffer)[-drifted_window_size:]
+                        
+                        # Retrain ONLY this tree on anomalies within that specific window
+                        anomaly_count = 0
+                        for drifted_x, drifted_y in drifted_records:
+                            if drifted_y == 1:  # Only attack records in the new concept
+                                self.models[tree_id].learn_one(drifted_x, drifted_y)
+                                anomaly_count += 1
+                        
+                        print(f"   Retrained Tree {tree_id} on {anomaly_count} anomalies from the drifted window.")
+                        
+                        # Reset this tree's ADWIN
+                        self.drift_detectors[tree_id].reset()
 
-                if retrain and len(retrain_data) > 0:
-                    self.tree_drifts[tree_id] += 1
-                    print(
-                        f"[DRIFT] Tree {tree_id} updating with "
-                        f"{len(retrain_data)} pseudo-labeled adaptive records"
-                    )
+                # CRITICAL: After checking all trees, remove the oldest record from the buffer
+                self.label_buffer.popleft()
 
-                    for old_x, pseudo_y in retrain_data:
-                        model.learn_one(old_x, int(pseudo_y))
-
-                states.append(condition)
-
+            # 5. LOGGING
             if self.total % 500 == 0:
-                self.print_metrics(rid, y, final_pred, tree_preds, anomaly_scores, states)
+                tree_accs = [
+                    self.tree_correct[i] / max(self.tree_total[i], 1) 
+                    for i in range(self.n_trees)
+                ]
+                self.print_metrics(rid, y, final_pred, confidence, tree_preds, tree_accs)
 
 
+# --- Instantiate and Run Spark ---
 ensemble = SparkHoeffdingEnsemble(n_trees=N_TREES)
-
 
 def foreach_batch_function(batch_df, batch_id):
     pdf = batch_df.toPandas()
-
     if len(pdf) == 0:
         return
 
@@ -303,11 +219,8 @@ def foreach_batch_function(batch_df, batch_id):
 def main():
     builder = (
         SparkSession.builder
-        .appName("KDD-Spark-Hoeffding-Ensemble-LabelFreeDrift")
-        .config(
-        "spark.jars.packages",
-        "org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.2"
-)
+        .appName("KDD-PerTree-ADWIN-ConfidenceDrift")
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.2")
     )
 
     if LOCAL_MODE:
