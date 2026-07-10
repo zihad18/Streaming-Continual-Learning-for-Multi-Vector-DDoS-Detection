@@ -17,12 +17,13 @@ from pyspark.sql.types import (
 # ---------------------------- Environment / Config ----------------------------
 MODEL_DIR = os.getenv("MODEL_DIR", ".")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "kdd_stream")
-KAFKA_SERVER = os.getenv("KAFKA_SERVER", "10.160.0.8:9092")
+KAFKA_SERVER = os.getenv("KAFKA_SERVER", "10.160.0.2:9092")
 N_TREES = int(os.getenv("N_TREES", "5"))
 ERROR_THRESHOLD = float(os.getenv("ERROR_THRESHOLD", "0.35"))
 
-LOCAL_MODE = os.getenv("LOCAL_MODE", "true").lower() == "true"
+LOCAL_MODE = os.getenv("LOCAL_MODE", "false").lower() == "true"
 BUCKET = os.getenv("BUCKET", "gs://kdd-streaming-bucket")
+
 # ----------------------------- Metrics Schema --------------------------------
 metrics_schema = StructType([
     StructField("node_host", StringType(), True),
@@ -30,6 +31,7 @@ metrics_schema = StructType([
     StructField("record_id", IntegerType(), True),
     StructField("true_label", IntegerType(), True),
     StructField("final_pred", IntegerType(), True),
+    StructField("prob_1", DoubleType(), True),
     StructField("accuracy", DoubleType(), True),
     StructField("precision", DoubleType(), True),
     StructField("recall", DoubleType(), True),
@@ -38,27 +40,24 @@ metrics_schema = StructType([
     StructField("event_time", DoubleType(), True),
 ])
 
-
 # ---------------------------- Helper Functions -------------------------------
 def row_to_dict(row):
     return {f"f{i}": float(v) for i, v in enumerate(row)}
-
 
 def safe_json_loads(value):
     if isinstance(value, bytes):
         value = value.decode("utf-8")
     return json.loads(value)
 
-
 def get_model_file(filename):
-    p1 = os.path.join(MODEL_DIR, filename)
-    p2 = SparkFiles.get(filename)
-    if os.path.exists(p1):
-        return p1
-    if os.path.exists(p2):
-        return p2
-    raise FileNotFoundError(f"Cannot find {filename}. Tried {p1} and {p2}")
-
+    # Try SparkFiles location (from addFile) first, then local path
+    try:
+        return SparkFiles.get(filename)
+    except Exception:
+        p1 = os.path.join(MODEL_DIR, filename)
+        if os.path.exists(p1):
+            return p1
+        raise FileNotFoundError(f"Cannot find {filename}. Tried SparkFiles and {p1}")
 
 # --------------------------- RealTimeOAW (unchanged) -------------------------
 class RealTimeOAW:
@@ -125,9 +124,9 @@ class RealTimeOAW:
 
         return self.condition, retrain, retrain_data
 
-
 # ------------------------- SparkHoeffdingEnsemble ----------------------------
 class SparkHoeffdingEnsemble:
+    # FIX: Load models using get_model_file() – this will load from SparkFiles
     def __init__(self, n_trees=N_TREES):
         self.preprocessor = joblib.load(get_model_file("preprocessor.pkl"))
         self.models = [
@@ -165,7 +164,8 @@ class SparkHoeffdingEnsemble:
         pred = int(pred)
         confidence = float(proba.get(pred, 1.0)) if proba else 0.5
         error_score = 1.0 - confidence
-        return pred, error_score
+        prob_1 = float(proba.get(1, 0.0)) if proba else 0.0
+        return pred, error_score, prob_1
 
     def update_metrics(self, y, pred):
         self.total += 1
@@ -190,28 +190,27 @@ class SparkHoeffdingEnsemble:
         recall = self.tp / max(self.tp + self.fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-12)
 
-        print("=" * 80)
-        print("Executor processed records:", self.total)
-        print("Record ID:", rid)
+        print("=" * 80, flush=True)
+        print("Executor processed records:", self.total, flush=True)
+        print("Record ID:", rid, flush=True)
         if y is not None:
-            print("True label:", y)
-        print("Tree predictions:", tree_preds)
-        print("Tree anomaly scores:", [round(s, 4) for s in scores])
-        print("Final ensemble prediction:", final_pred)
-        print("Tree states:", states)
+            print("True label:", y, flush=True)
+        print("Tree predictions:", tree_preds, flush=True)
+        print("Tree anomaly scores:", [round(s, 4) for s in scores], flush=True)
+        print("Final ensemble prediction:", final_pred, flush=True)
+        print("Tree states:", states, flush=True)
         if y is not None:
-            print("Ensemble accuracy:", round(accuracy, 4))
-            print("Precision:", round(precision, 4))
-            print("Recall:", round(recall, 4))
-            print("F1:", round(f1, 4))
-            print(f"Seen labels: normal={self.seen_normal}, anomaly={self.seen_anomaly}")
-            print(f"Confusion matrix: TP={self.tp}, TN={self.tn}, FP={self.fp}, FN={self.fn}")
+            print("Ensemble accuracy:", round(accuracy, 4), flush=True)
+            print("Precision:", round(precision, 4), flush=True)
+            print("Recall:", round(recall, 4), flush=True)
+            print("F1:", round(f1, 4), flush=True)
+            print(f"Seen labels: normal={self.seen_normal}, anomaly={self.seen_anomaly}", flush=True)
+            print(f"Confusion matrix: TP={self.tp}, TN={self.tn}, FP={self.fp}, FN={self.fn}", flush=True)
 
     def process_records(self, records):
-        # FIX: return [] instead of None when empty
         if len(records) == 0:
             return []
-
+        local_counter = 0 
         pdf = pd.DataFrame(records)
         has_label = "label" in pdf.columns
         labels = pdf["label"].astype(int).values if has_label else [None] * len(pdf)
@@ -222,7 +221,6 @@ class SparkHoeffdingEnsemble:
         )
         features = pdf.drop(columns=["label", "record_id"], errors="ignore")
 
-        # Preprocess
         cat_cols = self.preprocessor.transformers_[0][2]
         for col in cat_cols:
             if col in features.columns:
@@ -231,19 +229,25 @@ class SparkHoeffdingEnsemble:
 
         metrics = []
         for idx, x in enumerate(X):
-            t0 = time.time()                     # start time for latency
+            local_counter += 1
+            if local_counter % 100 == 0:
+                print(f"[EXECUTOR:{socket.gethostname()}] Processed {local_counter} records in this partition", flush=True)
+            t0 = time.time()
             y = None if labels[idx] is None else int(labels[idx])
             rid = int(record_ids[idx])
             x_dict = row_to_dict(x)
 
-            # Parallel predictions
             results = list(self.executor.map(
                 lambda model: self.prediction_and_score(model, x_dict),
                 self.models
             ))
-            tree_preds = [pred for pred, _ in results]
-            anomaly_scores = [score for _, score in results]
+            
+            tree_preds = [res[0] for res in results]
+            anomaly_scores = [res[1] for res in results]
+            tree_probs_1 = [res[2] for res in results]
+            
             final_pred = self.majority_vote(tree_preds)
+            ensemble_prob_1 = sum(tree_probs_1) / len(tree_probs_1) if tree_probs_1 else 0.0
 
             if y is not None:
                 self.update_metrics(y, final_pred)
@@ -251,7 +255,6 @@ class SparkHoeffdingEnsemble:
                 self.total += 1
 
             states = []
-            # Sequential drift detection & retraining
             for tree_id, model in enumerate(self.models):
                 pred = tree_preds[tree_id]
                 score = anomaly_scores[tree_id]
@@ -261,7 +264,6 @@ class SparkHoeffdingEnsemble:
                     if pred == y:
                         self.tree_correct[tree_id] += 1
 
-                # ---- Correct drift logic (restored) ----
                 prior_condition = self.detectors[tree_id].condition
                 if prior_condition == "Normal" or y is None:
                     error_signal = int(score >= ERROR_THRESHOLD)
@@ -272,9 +274,8 @@ class SparkHoeffdingEnsemble:
 
                 condition, retrain, retrain_data = self.detectors[tree_id].update(
                     anomaly_signal=error_signal,
-                    sample=(x_dict, y_S)          # store feature vector and pseudo‑label
+                    sample=(x_dict, y_S)
                 )
-                # ----------------------------------------
 
                 if retrain and len(retrain_data) > 0:
                     self.tree_drifts[tree_id] += 1
@@ -285,7 +286,6 @@ class SparkHoeffdingEnsemble:
 
                 states.append(condition)
 
-            # Compute aggregated metrics
             accuracy = self.correct / max(self.total, 1)
             precision = self.tp / max(self.tp + self.fp, 1)
             recall = self.tp / max(self.tp + self.fn, 1)
@@ -296,12 +296,13 @@ class SparkHoeffdingEnsemble:
                 "record_id": rid,
                 "true_label": -1 if y is None else y,
                 "final_pred": final_pred,
+                "prob_1": ensemble_prob_1,
                 "accuracy": accuracy,
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
                 "latency_ms": latency_ms,
-                "event_time": t0,                 # use start time
+                "event_time": t0,
             })
 
             if self.total % 500 == 0:
@@ -309,14 +310,13 @@ class SparkHoeffdingEnsemble:
 
         return metrics
 
-
 # ---------------------------- Spark Processing ------------------------------
 _executor_ensemble = None
-
 
 def process_partition(rows):
     global _executor_ensemble
     if _executor_ensemble is None:
+        # Now each executor loads the models once from SparkFiles
         _executor_ensemble = SparkHoeffdingEnsemble(n_trees=N_TREES)
 
     records = []
@@ -338,6 +338,7 @@ def process_partition(rows):
             record_id=m["record_id"],
             true_label=m["true_label"],
             final_pred=m["final_pred"],
+            prob_1=m["prob_1"],
             accuracy=m["accuracy"],
             precision=m["precision"],
             recall=m["recall"],
@@ -346,26 +347,15 @@ def process_partition(rows):
             event_time=m["event_time"],
         )
 
-
 def foreach_batch_function(batch_df, batch_id):
-    print(
-        f"[DRIVER] Batch {batch_id} received",
-        flush=True
-    )
+    print(f"[DRIVER] Batch {batch_id} received", flush=True)
 
     if batch_df.rdd.isEmpty():
-        print(
-            f"[DRIVER] Batch {batch_id} is EMPTY",
-            flush=True
-        )
+        print(f"[DRIVER] Batch {batch_id} is EMPTY", flush=True)
         return
 
     count = batch_df.count()
-
-    print(
-        f"[DRIVER] Batch {batch_id}: {count} Kafka records",
-        flush=True
-    )
+    print(f"[DRIVER] Batch {batch_id}: {count} Kafka records", flush=True)
 
     metrics_rdd = batch_df.rdd.mapPartitions(process_partition)
 
@@ -377,15 +367,13 @@ def foreach_batch_function(batch_df, batch_id):
     if LOCAL_MODE:
         output_path = "file:///C:/temp/metrics"
     else:
-        output_path = f"{GCS_BUCKET}/metrics/batch_id={batch_id}"
+        output_path = f"{BUCKET}/metrics/batch_id={batch_id}"
 
+    # Write as one fast file (coalesce to 1 partition)
     metrics_df.write.mode("append").json(output_path)
+    print(f"[DRIVER] Batch {batch_id} metrics written to {output_path}", flush=True)
 
-    print(
-        f"[DRIVER] Batch {batch_id} metrics written to {output_path}",
-        flush=True
-    )
-
+# ---------------------------- MAIN (FIXED) ----------------------------------
 def main():
     builder = SparkSession.builder.appName("GCP-Distributed-KDD-Hoeffding-Ensemble-Threaded")
     if LOCAL_MODE:
@@ -393,32 +381,55 @@ def main():
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
+    # -------------------------------------------------------------
+    # FIX 1: Distribute model files to all executors using addFile()
+    # No loading on the driver – this avoids OOM.
+    # -------------------------------------------------------------
+    model_files = ["preprocessor.pkl"] + [f"tree_{i}.pkl" for i in range(N_TREES)]
+    for fname in model_files:
+        # If MODEL_DIR is a local path, add that file
+        # If MODEL_DIR is a GCS path, you can use a gs:// URI directly
+        file_path = os.path.join(MODEL_DIR, fname)
+        if os.path.exists(file_path):
+            spark.sparkContext.addFile(file_path)
+        else:
+            # If not found, assume it's already in the working directory
+            spark.sparkContext.addFile(fname)
+    print("[DRIVER] Model files distributed via SparkFiles.", flush=True)
+
+    # -------------------------------------------------------------
+    # FIX 2: Read ALL records in ONE single batch and stop.
+    # -------------------------------------------------------------
     kafka_df = (
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_SERVER)
         .option("subscribe", KAFKA_TOPIC)
         .option("startingOffsets", "earliest")
+        .option("failOnDataLoss", "false")
+        .option("maxOffsetsPerTrigger", "30000")  # Bigger than your dataset
         .load()
     )
     values_df = kafka_df.selectExpr("CAST(value AS STRING) as value")
 
-    # ---- Checkpoint location: local or GCS ----
     if LOCAL_MODE:
         checkpoint = "file:///C:/temp/metrics"
     else:
-        checkpoint = f"{BUCKET}/checkpoints/kdd_stream_consumer"
+        checkpoint = f"{BUCKET}/checkpoints2/kdd_stream_consumer"
 
+    # -------------------------------------------------------------
+    # FIX 3: trigger(once=True) -> one batch only
+    # -------------------------------------------------------------
     query = (
         values_df.writeStream
         .foreachBatch(foreach_batch_function)
         .outputMode("append")
+        .trigger(once=True)
         .option("checkpointLocation", checkpoint)
         .start()
     )
 
     query.awaitTermination()
-
 
 if __name__ == "__main__":
     main()
